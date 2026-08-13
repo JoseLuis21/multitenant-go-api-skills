@@ -8,8 +8,9 @@ Dependencias:
 
 ```
 go get go.mongodb.org/mongo-driver/v2@latest   # v2.8.0 al momento de escribir esto
-go get github.com/google/uuid
 ```
+
+Nota que **no** aparece `github.com/google/uuid`: en este store los IDs son `bson.ObjectID`, que ya vienen en el driver. El UUID v7 es la convención del scaffold SQL (ver `references/postgres.md`), no de este.
 
 Todo el código de este archivo está verificado contra **v2.8.0**. El módulo v2 vive en una ruta de import distinta (`go.mongodb.org/mongo-driver/v2/...`), así que convive con v1 en el mismo `go.mod` si estás migrando por partes; para un proyecto nuevo, usa solo v2.
 
@@ -263,7 +264,9 @@ const (
 )
 
 type TenantDatabase struct {
-    CompanyID    string  `bson:"_id"`
+    // _id es el ObjectID de la empresa en el plano de control. Hacia afuera
+    // (JWT, URLs, caché en memoria) el companyID viaja como hex.
+    CompanyID    bson.ObjectID `bson:"_id"`
     DatabaseName string  `bson:"databaseName"`
     // Vacío = vive en el cluster compartido. Con valor = cluster propio.
     DatabaseURI  string  `bson:"databaseUri,omitempty"`
@@ -299,19 +302,24 @@ func NewTenantManager(sharedClient *mongo.Client, controlDB *mongo.Database) (*T
 
 ```go
 func (m *TenantManager) Provision(ctx context.Context, company Company) error {
+    // El ID entra como hex y se convierte una sola vez, aquí en el borde.
+    companyID, err := bson.ObjectIDFromHex(company.ID)
+    if err != nil {
+        return fmt.Errorf("invalid company id %q: %w", company.ID, err)
+    }
     databaseName := tenantDatabaseName(company.ID, company.Slug)
 
     // Se registra antes de tocar nada: si el proceso muere a mitad, la empresa
     // queda visible como 'provisioning' y el reintento es posible.
     if err := m.upsertTenantDatabase(ctx, TenantDatabase{
-        CompanyID: company.ID, DatabaseName: databaseName,
+        CompanyID: companyID, DatabaseName: databaseName,
         Status: TenantDatabaseStatusProvisioning,
     }); err != nil {
         return fmt.Errorf("register tenant database: %w", err)
     }
 
     fail := func(step string, err error) error {
-        _ = m.markFailed(ctx, company.ID, err)
+        _ = m.markFailed(ctx, companyID, err)
         return fmt.Errorf("%s: %w", step, err)
     }
 
@@ -322,19 +330,21 @@ func (m *TenantManager) Provision(ctx context.Context, company Company) error {
     if err := RunTenantMigrations(ctx, tenantDB); err != nil {
         return fail("run tenant migrations", err)
     }
-    if err := seedTenantCompany(ctx, tenantDB, company); err != nil {
+    if err := seedTenantCompany(ctx, tenantDB, companyID, company); err != nil {
         return fail("seed tenant company", err)
     }
 
     return m.upsertTenantDatabase(ctx, TenantDatabase{
-        CompanyID: company.ID, DatabaseName: databaseName,
+        CompanyID: companyID, DatabaseName: databaseName,
         Status: TenantDatabaseStatusReady,
     })
 }
 
-func seedTenantCompany(ctx context.Context, db *mongo.Database, company Company) error {
+// El documento espejo de la empresa conserva el mismo _id que tiene en el plano
+// de control: es lo que permite reconciliar tenant y control sin una tabla de mapeo.
+func seedTenantCompany(ctx context.Context, db *mongo.Database, companyID bson.ObjectID, company Company) error {
     _, err := db.Collection("tenant_company").UpdateOne(ctx,
-        bson.M{"_id": company.ID},
+        bson.M{"_id": companyID},
         bson.M{"$set": bson.M{
             "slug": company.Slug, "name": company.Name, "updatedAt": time.Now().UTC(),
         }, "$setOnInsert": bson.M{"createdAt": time.Now().UTC()}},
@@ -347,6 +357,8 @@ func seedTenantCompany(ctx context.Context, db *mongo.Database, company Company)
 ### Resolución y caché
 
 ```go
+// companyID llega como hex (viene del claim cid del JWT). El caché se indexa por
+// ese hex; la conversión a ObjectID ocurre solo al consultar la base de control.
 func (m *TenantManager) Resolve(ctx context.Context, companyID string) (*mongo.Database, error) {
     if companyID == "" {
         return nil, errors.New("company id is required")
@@ -428,11 +440,12 @@ func (m *TenantManager) Close() {
 ### Nombre de la base
 
 ```go
-// tenant_<slug>_<id sin guiones>. Límite duro de Mongo: 63 bytes, y no admite
+// tenant_<slug>_<id>. companyID es el hex del ObjectID: 24 caracteres [a-f0-9],
+// así que entra completo. Límite duro de Mongo: 63 bytes, y no admite
 // / \ . " $ * < > : | ? ni espacios. Normalizar a [a-z0-9_] deja fuera todo eso.
 func tenantDatabaseName(companyID, slug string) string {
     normalizedSlug := normalizePart(slug)
-    normalizedID := normalizePart(strings.ReplaceAll(companyID, "-", ""))
+    normalizedID := normalizePart(companyID)
     if normalizedSlug == "" {
         normalizedSlug = "company"
     }
@@ -458,6 +471,7 @@ func normalizePart(value string) string {
 
 ```go
 func (m *TenantManager) upsertTenantDatabase(ctx context.Context, record TenantDatabase) error {
+    // record.CompanyID ya es un ObjectID: el filtro coincide con el tipo guardado.
     now := time.Now().UTC()
     _, err := m.controlDB.Collection("tenant_databases").UpdateOne(ctx,
         bson.M{"_id": record.CompanyID},
@@ -477,9 +491,15 @@ func (m *TenantManager) upsertTenantDatabase(ctx context.Context, record TenantD
 }
 
 func (m *TenantManager) getTenantDatabase(ctx context.Context, companyID string) (*TenantDatabase, error) {
+    objectID, err := bson.ObjectIDFromHex(companyID)
+    if err != nil {
+        // Un cid que no es un ObjectID es un token manipulado o de otro entorno.
+        return nil, fmt.Errorf("invalid company id %q: %w", companyID, err)
+    }
+
     var record TenantDatabase
-    err := m.controlDB.Collection("tenant_databases").
-        FindOne(ctx, bson.M{"_id": companyID}).Decode(&record)
+    err = m.controlDB.Collection("tenant_databases").
+        FindOne(ctx, bson.M{"_id": objectID}).Decode(&record)
     if errors.Is(err, mongo.ErrNoDocuments) {
         return nil, fmt.Errorf("tenant database for company %s not found", companyID)
     }
@@ -511,7 +531,7 @@ func runReadyTenantMigrations(ctx context.Context, client *mongo.Client, control
             db := client.Database(record.DatabaseName)
             if err := database.RunTenantMigrations(groupCtx, db); err != nil {
                 // Una empresa con problemas no debe impedir que la API levante.
-                slog.Error("tenant migration failed", "companyID", record.CompanyID, "error", err)
+                slog.Error("tenant migration failed", "companyID", record.CompanyID.Hex(), "error", err)
             }
             return nil
         })
@@ -519,6 +539,74 @@ func runReadyTenantMigrations(ctx context.Context, client *mongo.Client, control
     return group.Wait()
 }
 ```
+
+## IDs: `_id` es un `bson.ObjectID`
+
+En Mongo el identificador es el nativo del motor, no un UUID. Un `ObjectID` ya trae lo que se busca con UUID v7 —los primeros 4 bytes son el timestamp, así que ordenar por `_id` es ordenar por fecha de creación y el índice primario no se fragmenta— y además ocupa 12 bytes en vez de 16, se ve como `ObjectId("…")` en Compass y en `mongosh`, y es lo que espera cualquier herramienta del ecosistema. Guardar un UUID en `_id` obliga a un índice sobre un string de 36 caracteres y rompe esa integración a cambio de nada.
+
+La generación vive en un solo archivo, igual que en el scaffold SQL, para que el dominio y los casos de uso nunca importen el driver:
+
+```go
+// internal/shared/id/id.go  — variante MongoDB
+package id
+
+import "go.mongodb.org/mongo-driver/v2/bson"
+
+// New devuelve un ObjectID nuevo en hexadecimal. Hacia afuera el ID es siempre
+// un string de 24 caracteres: el dominio, los DTOs, el JWT y las URLs no saben
+// de qué tipo es en la base.
+func New() string { return bson.NewObjectID().Hex() }
+
+// Valid dice si un id recibido por la URL tiene forma de ObjectID; el handler
+// puede responder 404 en vez de dejar que el repositorio falle al parsear.
+func Valid(value string) bool {
+    _, err := bson.ObjectIDFromHex(value)
+    return err == nil
+}
+```
+
+La conversión hex ↔ `ObjectID` vive **solo** en la capa de persistencia, en el modelo:
+
+```go
+package mongodb
+
+type productModel struct {
+    ID        bson.ObjectID `bson:"_id"`
+    Code      string        `bson:"code"`
+    Name      string        `bson:"name"`
+    Price     int64         `bson:"price"`
+    IsActive  bool          `bson:"isActive"`
+    CreatedAt time.Time     `bson:"createdAt"`
+    DeletedAt *time.Time    `bson:"deletedAt"`
+}
+
+func toModel(product domain.Product) (productModel, error) {
+    objectID, err := bson.ObjectIDFromHex(product.ID)
+    if err != nil {
+        return productModel{}, fmt.Errorf("invalid product id %q: %w", product.ID, err)
+    }
+    return productModel{ID: objectID, Code: product.Code, ...}, nil
+}
+
+func (m productModel) toDomain() domain.Product {
+    return domain.Product{ID: m.ID.Hex(), Code: m.Code, ...}
+}
+
+// Un hex inválido no puede coincidir con ningún documento, así que los métodos
+// de lectura lo tratan como "no existe" y no como error de infraestructura.
+func objectIDFilter(id string) (bson.M, bool) {
+    objectID, err := bson.ObjectIDFromHex(id)
+    if err != nil {
+        return nil, false
+    }
+    return bson.M{"_id": objectID, "deletedAt": nil}, true
+}
+```
+
+Dos consecuencias que conviene tener presentes:
+
+- **Nunca filtres con el string.** `bson.M{"_id": "68a1…"}` compila, no da error y no encuentra nada: en BSON un string y un ObjectID son tipos distintos. Es el bug clásico al migrar desde un `_id` de UUID — se ve como "el registro desapareció".
+- **Referencias entre documentos** (`createdBy`, `companyId`, `roleId`) también van como `ObjectID`, no como string, o los `$lookup` no cruzan. El único `_id` que sigue siendo string es el de las colecciones con clave natural: `permissions` (`"products:create"`) y `schema_migrations` (el nombre de la migración).
 
 ## Repositorios
 
@@ -539,7 +627,10 @@ func (r *ProductRepository) collection(ctx context.Context) *mongo.Collection {
 }
 
 func (r *ProductRepository) Create(ctx context.Context, product domain.Product) error {
-    doc := toModel(product) // _id = product.ID (uuid v7 string)
+    doc, err := toModel(product) // _id = ObjectID(product.ID)
+    if err != nil {
+        return err
+    }
 
     if _, err := r.collection(ctx).InsertOne(ctx, doc); err != nil {
         // Traducir el error del driver a un error de dominio aquí evita que el
@@ -553,8 +644,13 @@ func (r *ProductRepository) Create(ctx context.Context, product domain.Product) 
 }
 
 func (r *ProductRepository) GetByID(ctx context.Context, id string) (*domain.Product, error) {
+    filter, ok := objectIDFilter(id)
+    if !ok {
+        return nil, nil // hex inválido: no existe, no es un 500
+    }
+
     var model productModel
-    err := r.collection(ctx).FindOne(ctx, bson.M{"_id": id, "deletedAt": nil}).Decode(&model)
+    err := r.collection(ctx).FindOne(ctx, filter).Decode(&model)
     if errors.Is(err, mongo.ErrNoDocuments) {
         return nil, nil // "no existe" no es un error de infraestructura; lo decide el caso de uso
     }
@@ -617,16 +713,23 @@ func WithTransaction(ctx context.Context, client *mongo.Client, fn func(ctx cont
 
 // Uso: mover stock y registrar el movimiento como una sola unidad.
 func (r *ProductRepository) MoveStock(ctx context.Context, productID string, qty int) error {
+    objectID, err := bson.ObjectIDFromHex(productID)
+    if err != nil {
+        return domain.ErrProductNotFound
+    }
+
     db := database.DatabaseFromContext(ctx, r.db)
     return WithTransaction(ctx, r.client, func(ctx context.Context) error {
         if _, err := db.Collection("products").UpdateOne(ctx,
-            bson.M{"_id": productID},
+            bson.M{"_id": objectID},
             bson.M{"$inc": bson.M{"stock": qty}},
         ); err != nil {
             return err
         }
+        // productId como ObjectID, no como string: es una referencia a products._id
+        // y con el tipo equivocado ningún $lookup la va a cruzar.
         _, err := db.Collection("stock_movements").InsertOne(ctx, bson.M{
-            "productId": productID, "quantity": qty,
+            "productId": objectID, "quantity": qty,
         })
         return err
     })
@@ -637,7 +740,7 @@ Ojo con multi-tenant: una transacción no puede cruzar clusters. Si el tenant ti
 
 ## Particularidades de Mongo que hay que decidir explícitamente
 
-- **`_id` es el ID de dominio**, un string UUID v7, no un `bson.ObjectID`. Así los IDs son iguales entre el plano de control y los tenants, y una API que los devuelve no cambia de formato según la tabla. UUID v7 además es ordenable por tiempo, lo que mantiene sano el índice.
+- **`_id` es un `bson.ObjectID`**, el ID nativo del motor — no un UUID. Ya es ordenable por tiempo (los primeros 4 bytes son el timestamp), pesa 12 bytes y se ve bien en Compass y `mongosh`. Hacia afuera viaja como hex de 24 caracteres, y la conversión ocurre solo en la capa de persistencia; ver la sección **IDs** más arriba. El UUID v7 queda para el scaffold de PostgreSQL. Excepción: las colecciones con clave natural (`permissions`, `schema_migrations`) siguen con `_id` string.
 - **Transacciones sólo con replica set.** Un Mongo local de un nodo no las soporta. Si la lógica de negocio las necesita, levanta el entorno de desarrollo como replica set de un nodo (`--replSet rs0` + `rs.initiate()`); el `docker-compose.mongo.yml` de `assets/` ya viene así. Si no las necesitas, prefiere operaciones atómicas de un solo documento: `$inc`, `$set` condicionado y `findOneAndUpdate` con filtro son atómicos por documento y resuelven la mayoría de las carreras.
 - **Unicidad = índice único.** No existe la constraint declarativa: si un campo debe ser único, hay un índice único en una migración, y el repositorio traduce el duplicado con `mongo.IsDuplicateKeyError`. Sin ese índice, la validación "ya existe" es un chequeo previo con una carrera en el medio.
 - **Borrado lógico**: `deletedAt: null` en los documentos vivos, e índice único parcial con `partialFilterExpression: {deletedAt: null}` para que el código de un producto borrado se pueda reutilizar.

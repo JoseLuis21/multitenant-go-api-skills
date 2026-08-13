@@ -120,6 +120,8 @@ type EventEmitter interface {
 
 Nota que ningún método recibe `companyID`: la empresa ya está en el contexto y determina la base.
 
+**El `id string` del puerto es opaco a propósito.** El dominio nunca sabe si detrás hay un `uuid.UUID` (PostgreSQL) o un `bson.ObjectID` (MongoDB); esa traducción vive entera en `infrastructure/persistence/`. En el repositorio de Mongo eso significa un `bson.ObjectIDFromHex` al entrar y un `.Hex()` al salir, y tratar el hex inválido como "no existe" en vez de propagar un error de parseo. En el de Postgres, un `uuid.Parse` con el mismo criterio. Ver `references/mongodb.md` (sección **IDs**) y `references/postgres.md` (**Convenciones de esquema**).
+
 ## Aplicación
 
 ```go
@@ -167,12 +169,11 @@ func (uc *CreateProductUseCase) Execute(ctx context.Context, input dto.CreatePro
         return nil, domain.ErrProductCodeTaken
     }
 
-    // 2. Entidad
-    id, err := uuid.NewV7()
-    if err != nil {
-        return nil, fmt.Errorf("new product id: %w", err)
-    }
-    product, err := domain.NewProduct(id.String(), input.Code, input.Name, input.Price, createdBy)
+    // 2. Entidad. El ID sale de shared/id, nunca del driver: con PostgreSQL es
+    //    un uuid v7 y con MongoDB el hex de un ObjectID, y el caso de uso no
+    //    necesita saber cuál — para él es un string opaco.
+    newID := id.New()
+    product, err := domain.NewProduct(newID, input.Code, input.Name, input.Price, createdBy)
     if err != nil {
         return nil, err
     }

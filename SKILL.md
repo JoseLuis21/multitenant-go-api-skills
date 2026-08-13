@@ -42,6 +42,7 @@ Estas son las reglas que hacen que la arquitectura funcione. Explícalas cuando 
 5. **Dos juegos de migraciones, en carpetas separadas**: las de control corren al arranque sobre la base de control; las de tenant corren (a) al provisionar una empresa y (b) al arranque sobre cada tenant en estado `ready`. Ambas idempotentes y registradas en `schema_migrations`.
 6. **El catálogo de permisos vive en el plano de control** y es la fuente de verdad: un rol solo puede tener permisos que existan en el catálogo. Cada recurso nuevo agrega sus permisos en una migración de control.
 7. **Recursos y rutas en inglés**, aunque el dominio se hable en español (`vendedores` → recurso `sellers`, ruta `/api/v1/sellers`, permisos `sellers:*`). Sin esta convención el catálogo de permisos se vuelve una mezcla imposible de mantener.
+8. **El ID lo decide el store, no el módulo.** Con PostgreSQL, `uuid.NewV7()` (ordenable por tiempo, no fragmenta el índice primario). Con MongoDB, el `_id` nativo: `bson.ObjectID` — que ya es ordenable por tiempo, ocupa 12 bytes en vez de 16 y es lo que espera cualquier herramienta de Mongo. **No metas UUID en Mongo ni ObjectID en Postgres.** Para que el resto del código no dependa de esa decisión, la generación vive en un solo archivo, `internal/shared/id/id.go`, que expone `id.New() string`; el dominio y los casos de uso siempre ven un `string` opaco.
 
 ## Paso 1 — Estructura
 
@@ -63,6 +64,7 @@ internal/
   shared/
     httpresponse/                    # envoltorio único de respuesta {success,message,data}
     crypto/                          # hash de password, cifrado de secretos
+    id/                              # id.New(): uuid v7 en Postgres, bson.ObjectID en Mongo
   modules/
     auth/                            # usuarios, login, sesión, JWT, middlewares de auth y permiso
     <tenant>/                        # empresas: alta + provisioning de su base
@@ -90,7 +92,7 @@ internal/modules/<modulo>/
 Construye en este orden y compila (`go build ./...`) después de cada bloque; así los errores aparecen de a uno.
 
 1. `go.mod`, `Makefile`, `.env.example`, `docker-compose.yml`, `Dockerfile` — están en `assets/`, cópialos y ajusta el nombre del módulo.
-2. `shared/httpresponse` y `shared/crypto`.
+2. `shared/httpresponse`, `shared/crypto` y `shared/id` (la variante del store elegido).
 3. `platform/database`: conexión, runner de migraciones, contexto de tenant, tenant manager, middleware de tenant.
 4. Migraciones de control: usuarios, empresas, membresías, `tenant_databases`, roles, catálogo de permisos, `role_permissions`, `user_roles`.
 5. Migraciones de tenant: la tabla/colección espejo de la empresa (`tenant_company`) y lo que necesite el módulo de ejemplo.
@@ -125,6 +127,7 @@ Vale la pena revisarlos antes de dar el trabajo por cerrado; todos son bugs que 
 - **Ruta literal después de la paramétrica** — en Fiber, `/:id` registrado antes que `/summary` se traga `/summary` y devuelve un 500 de parseo. Las rutas literales van primero, siempre.
 - **Permisos del rol guardados en dos lugares** — si el rol tiene una columna JSON de permisos _y_ una tabla `role_permissions`, define cuál manda (la tabla) y haz que la otra sea derivada o no exista. Con dos fuentes, los `INSERT` a la que nadie lee no otorgan nada y el bug tarda meses en aparecer.
 - **Migración puesta en la carpeta que no se ejecuta** — la tabla nunca se crea y el error aparece recién al primer request.
+- **En Mongo, filtrar por `_id` con el string en vez del `ObjectID`** — `bson.M{"_id": "68a1…"}` compila, no da error y devuelve cero documentos, porque en BSON un string y un ObjectID son tipos distintos. Se ve como "el registro desapareció". Lo mismo con las referencias (`companyId`, `roleId`): guardadas como string, ningún `$lookup` las cruza.
 - **Escalas distintas entre tablas** — si guardas dinero o cantidades en micro-unidades en un lado y en unidades en otro, los informes cuadran en los tests y mienten en producción. Documenta la escala junto a la columna.
 - **Validar solo contra un tenant vacío** — prueba que el código corre, no que está bien. Siembra datos sintéticos.
 

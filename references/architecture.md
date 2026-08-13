@@ -233,7 +233,7 @@ type StockDispatcher interface {
 Fiber resuelve por orden de registro, así que una ruta paramétrica declarada antes se come a las literales:
 
 ```go
-// mal: GET /products/summary entra por :id y revienta al parsear el UUID
+// mal: GET /products/summary entra por :id y revienta al parsear el ID
 products.Get("/:id", h.Get)
 products.Get("/summary", h.Summary)
 

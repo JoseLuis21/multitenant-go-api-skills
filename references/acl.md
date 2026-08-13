@@ -145,12 +145,15 @@ Agrega además las tablas de tokens: `email_verifications`, `password_setup_toke
 
 Las mismas colecciones, con estas diferencias:
 
-- `users`: `_id` = uuid string; índices únicos en `email` y `emailNormalized`.
+- **Los IDs son `bson.ObjectID`, no UUID.** `users._id`, `companies._id`, `roles._id` y toda referencia entre documentos (`userId`, `companyId`, `roleId`, `createdBy`, `updatedBy`, `deletedBy`) se guardan como `ObjectID`. El UUID v7 es la convención del esquema SQL de arriba. Si guardas una referencia como string, el filtro no encuentra nada y ningún `$lookup` cruza — sin error, solo resultados vacíos.
+- `users`: índices únicos en `email` y `emailNormalized`.
 - `roles`: índice único parcial en `{companyId: 1, name: 1}` con `partialFilterExpression: {deletedAt: null}`.
-- `permissions`: `_id` = la key (`"products:create"`); índice único en `{resource, action}`.
+- `permissions`: `_id` = la key (`"products:create"`), string y no ObjectID — es una clave natural, y ese `_id` es exactamente lo que se guarda en `role_permissions.permissionKey` y lo que viaja en el claim `perms`. Índice único en `{resource, action}`.
 - `role_permissions`: un documento por trío, con índice único en `{companyId, roleId, permissionKey}`. Alternativa: un arreglo `permissionKeys` dentro del documento del rol — es legítimo en Mongo y evita el join, **siempre que sea el único lugar donde viven**. La regla de una sola fuente de verdad no cambia con el motor.
 - `user_roles`: índice único en `{companyId, userId}`.
 - Mongo no tiene claves foráneas: la integridad que en SQL da la FK compuesta `(company_id, role_id)` hay que hacerla cumplir en el caso de uso — al asignar un rol, verifica que el rol pertenezca a esa empresa antes de escribir.
+
+En el JWT los IDs viajan siempre como string: `sub` es el hex del `_id` del usuario y `cid` el de la empresa. Los middlewares y los casos de uso trabajan con ese string; el repositorio de Mongo es el único que hace `bson.ObjectIDFromHex`.
 
 ## Formato de los permisos
 
@@ -338,7 +341,9 @@ func (s *RoleSeederService) SeedDefaultAdminRole(ctx context.Context, companyID,
         return s.assignments.AssignRole(ctx, userID, existing.ID, companyID)
     }
 
-    roleID := uuid.Must(uuid.NewV7()).String()
+    // id.New(): uuid v7 con PostgreSQL, hex de ObjectID con MongoDB. El caso de
+    // uso no sabe cuál de los dos es, y por eso este archivo sirve para ambos.
+    roleID := id.New()
     role, err := domain.NewRole(roleID, companyID, "admin", nil, []string{"*:*"}, userID)
     if err != nil {
         return fmt.Errorf("seed admin role: create entity: %w", err)

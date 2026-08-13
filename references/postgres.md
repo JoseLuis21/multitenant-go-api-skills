@@ -562,7 +562,29 @@ func (r *ProductRepository) List(ctx context.Context, filters domain.Filters) ([
 
 ## Convenciones de esquema
 
-- **IDs**: `uuid.NewV7()` — ordenables por tiempo, así el índice primario no se fragmenta como con v4.
+- **IDs**: `uuid.NewV7()` — ordenables por tiempo, así el índice primario no se fragmenta como con v4. **UUID v7 es la convención del store SQL únicamente**; si el proyecto es MongoDB, el `_id` es un `bson.ObjectID` nativo (ver `references/mongodb.md`). Toda la generación vive en un solo lugar para que el dominio no se entere:
+
+```go
+// internal/shared/id/id.go  — variante PostgreSQL
+package id
+
+import "github.com/google/uuid"
+
+// New devuelve un identificador nuevo ordenable por tiempo.
+// El resto del código lo trata como un string opaco: si mañana el proyecto
+// cambia de store, solo cambia este archivo.
+func New() string { return uuid.Must(uuid.NewV7()).String() }
+
+// Valid dice si un id recibido por la URL tiene forma de UUID. Sirve para
+// devolver 404/422 en el handler en vez de un 500 al parsear en el repositorio.
+func Valid(value string) bool {
+    _, err := uuid.Parse(value)
+    return err == nil
+}
+```
+
+`uuid.Must` es aceptable aquí: `NewV7` solo falla si el generador de aleatoriedad del sistema falla, y en ese caso el proceso no tiene nada que hacer en pie.
+
 - **Auditoría**: `created_by`, `created_at`, `updated_by`, `updated_at` en toda tabla de negocio.
 - **Borrado lógico**: `is_active BOOLEAN`, `deleted_at TIMESTAMPTZ`, `deleted_by UUID`; los índices únicos van con `WHERE deleted_at IS NULL` para poder reutilizar un código liberado.
 - **Índices**: todo campo por el que se filtre u ordene.
