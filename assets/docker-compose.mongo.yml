@@ -1,6 +1,6 @@
 services:
   db:
-    image: mongo:7
+    image: mongo:8
     container_name: app-mongo
     restart: unless-stopped
     # Replica set de un solo nodo: Mongo no permite transacciones en modo

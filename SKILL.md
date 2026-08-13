@@ -136,7 +136,7 @@ Lee el archivo del store elegido **completo** antes de escribir la capa de datos
 | ------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `references/architecture.md`    | Siempre. Plano de control vs tenant, contrato del `TenantManager`, envoltorio de respuestas, cableado del bootstrap.                                                    |
 | `references/postgres.md`        | Store = PostgreSQL. Pool pgx, provisioning con `CREATE DATABASE`, runner de migraciones `.sql` embebidas, repositorios.                                                 |
-| `references/mongodb.md`         | Store = MongoDB. Cliente compartido, base por empresa, migraciones como registry de funciones Go, índices, repositorios.                                                |
+| `references/mongodb.md`         | Store = MongoDB. Driver v2 (`mongo-driver/v2`), cliente compartido, base por empresa, migraciones como registry de funciones Go, índices, repositorios.                 |
 | `references/acl.md`             | Al construir `auth` y `acl`: esquema de usuarios/roles/permisos, claims del JWT, `RequirePermission`, siembra del rol admin, cómo agregar permisos de un recurso nuevo. |
 | `references/module-template.md` | Cada vez que agregues un módulo de negocio. Checklist completo de las tres capas.                                                                                       |
 

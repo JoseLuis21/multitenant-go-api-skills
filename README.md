@@ -51,7 +51,7 @@ SKILL.md                        instrucciones y flujo de trabajo
 references/
   architecture.md               control plane vs tenant, TenantManager, bootstrap
   postgres.md                   implementación con pgx v5
-  mongodb.md                    implementación con mongo-go-driver
+  mongodb.md                    implementación con mongo-go-driver v2
   acl.md                        usuarios, roles, permisos, JWT
   module-template.md            plantilla de módulo de negocio
 assets/

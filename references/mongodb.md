@@ -1,10 +1,38 @@
-# Store: MongoDB (mongo-go-driver)
+# Store: MongoDB (mongo-go-driver v2)
 
 Una **base de datos por empresa** dentro del mismo cluster. El driver ya maneja su propio pool de conexiones, así que hay un solo `*mongo.Client` compartido y lo que se resuelve por tenant es el `*mongo.Database`. Esto es más barato que en PostgreSQL: cambiar de tenant es elegir un handle, no abrir conexiones.
 
 Si algún tenant necesita su propio cluster (un cliente grande, o requisitos de residencia de datos), `tenant_databases` guarda su URI y el manager abre un cliente aparte solo para él. El resto sigue usando el compartido.
 
-Dependencias: `go.mongodb.org/mongo-driver/mongo`, `github.com/google/uuid`. Los ejemplos son para el driver v1.17; en v2 `mongo.Connect` ya no recibe `ctx` y los paquetes de opciones cambian de ruta, pero la estructura es idéntica.
+Dependencias:
+
+```
+go get go.mongodb.org/mongo-driver/v2@latest   # v2.8.0 al momento de escribir esto
+go get github.com/google/uuid
+```
+
+Todo el código de este archivo está verificado contra **v2.8.0**. El módulo v2 vive en una ruta de import distinta (`go.mongodb.org/mongo-driver/v2/...`), así que convive con v1 en el mismo `go.mod` si estás migrando por partes; para un proyecto nuevo, usa solo v2.
+
+## Si vienes del driver v1
+
+Estos son los cambios que rompen compilación al pasar de v1.17 a v2. Vale la pena leerlos antes que el código, porque el resto de la estructura es idéntica.
+
+| v1                                          | v2                                                        |
+| ------------------------------------------- | --------------------------------------------------------- |
+| `go.mongodb.org/mongo-driver/...`           | `go.mongodb.org/mongo-driver/v2/...`                      |
+| `mongo-driver/bson/primitive`               | desapareció: los tipos viven en `bson` (`bson.ObjectID`, `bson.Decimal128`, `bson.DateTime`, `bson.Binary`) |
+| `mongo.Connect(ctx, opts)`                  | `mongo.Connect(opts)` — ya no recibe contexto             |
+| `options.Update()`                          | `options.UpdateOne()` / `options.UpdateMany()`            |
+| `primitive.ParseDecimal128("1.23")`         | `bson.ParseDecimal128("1.23")`                            |
+| `SetSocketTimeout` / timeouts por operación | `SetTimeout` (CSOT): un solo presupuesto por operación, reintentos incluidos |
+| `WithTransaction(func(sc mongo.SessionContext) ...)` | `WithTransaction(func(ctx context.Context) (any, error))` |
+| `coll.Distinct(...) ([]any, error)`         | devuelve `*mongo.DistinctResult`, se lee con `.Decode(&v)` |
+| `res.DecodeBytes()`                         | `res.Raw()`                                               |
+| `mongo.NewClient` + `client.Connect(ctx)`   | eliminado; solo `mongo.Connect(opts)`                     |
+
+Lo que **no** cambió y se usa en todo este archivo: `bson.M` / `bson.D`, `mongo.ErrNoDocuments`, `mongo.IsDuplicateKeyError`, `mongo.CommandError`, `mongo.IndexModel`, `cursor.All`, `client.Ping`, `client.Disconnect(ctx)`.
+
+Las opciones siguen siendo builders encadenables (`options.Find().SetSort(...)`), pero internamente ahora son `options.Lister[T]`: ya no puedes construir un `&options.FindOptions{}` a mano y pasarlo.
 
 ## Conexión
 
@@ -17,10 +45,11 @@ import (
     "fmt"
     "net/url"
     "strings"
+    "time"
 
-    "go.mongodb.org/mongo-driver/mongo"
-    "go.mongodb.org/mongo-driver/mongo/options"
-    "go.mongodb.org/mongo-driver/mongo/readpref"
+    "go.mongodb.org/mongo-driver/v2/mongo"
+    "go.mongodb.org/mongo-driver/v2/mongo/options"
+    "go.mongodb.org/mongo-driver/v2/mongo/readpref"
 )
 
 type Info struct {
@@ -46,15 +75,20 @@ func NewMongoClient(ctx context.Context, mongoURI string) (*mongo.Client, error)
     opts := options.Client().
         ApplyURI(mongoURI).
         SetMaxPoolSize(50).
-        SetRetryWrites(true)
+        SetRetryWrites(true).
+        // CSOT: presupuesto de tiempo de la operación completa, incluidos los
+        // reintentos y la selección de servidor. Reemplaza al SocketTimeout de v1
+        // y evita que un request de la API quede colgado sin deadline propio.
+        SetTimeout(10 * time.Second)
 
-    client, err := mongo.Connect(ctx, opts)
+    // En v2 Connect ya no recibe ctx: no hace I/O, solo arma el cliente.
+    client, err := mongo.Connect(opts)
     if err != nil {
         return nil, fmt.Errorf("connect mongo: %w", err)
     }
 
-    // mongo.Connect es perezoso: no toca el servidor. Sin este ping, unas
-    // credenciales malas recién explotan en el primer request.
+    // Sigue siendo perezoso: sin este ping, unas credenciales malas recién
+    // explotan en el primer request.
     if err := client.Ping(ctx, readpref.Primary()); err != nil {
         _ = client.Disconnect(ctx)
         return nil, fmt.Errorf("ping mongo: %w", err)
@@ -116,8 +150,8 @@ import (
     "sort"
     "time"
 
-    "go.mongodb.org/mongo-driver/bson"
-    "go.mongodb.org/mongo-driver/mongo"
+    "go.mongodb.org/mongo-driver/v2/bson"
+    "go.mongodb.org/mongo-driver/v2/mongo"
 )
 
 type Migration struct {
@@ -304,7 +338,7 @@ func seedTenantCompany(ctx context.Context, db *mongo.Database, company Company)
         bson.M{"$set": bson.M{
             "slug": company.Slug, "name": company.Name, "updatedAt": time.Now().UTC(),
         }, "$setOnInsert": bson.M{"createdAt": time.Now().UTC()}},
-        options.Update().SetUpsert(true),
+        options.UpdateOne().SetUpsert(true), // en v1 era options.Update()
     )
     return err
 }
@@ -437,7 +471,7 @@ func (m *TenantManager) upsertTenantDatabase(ctx context.Context, record TenantD
             },
             "$setOnInsert": bson.M{"createdAt": now},
         },
-        options.Update().SetUpsert(true),
+        options.UpdateOne().SetUpsert(true),
     )
     return err
 }
@@ -473,7 +507,6 @@ func runReadyTenantMigrations(ctx context.Context, client *mongo.Client, control
     group, groupCtx := errgroup.WithContext(ctx)
     group.SetLimit(4)
     for _, record := range records {
-        record := record
         group.Go(func() error {
             db := client.Database(record.DatabaseName)
             if err := database.RunTenantMigrations(groupCtx, db); err != nil {
@@ -493,11 +526,12 @@ func runReadyTenantMigrations(ctx context.Context, client *mongo.Client, control
 package mongodb
 
 type ProductRepository struct {
-    db *mongo.Database // fallback; en un request gana el handle del contexto
+    db     *mongo.Database // fallback; en un request gana el handle del contexto
+    client *mongo.Client   // solo si el módulo usa transacciones (ver más abajo)
 }
 
-func NewProductRepository(db *mongo.Database) *ProductRepository {
-    return &ProductRepository{db: db}
+func NewProductRepository(db *mongo.Database, client *mongo.Client) *ProductRepository {
+    return &ProductRepository{db: db, client: client}
 }
 
 func (r *ProductRepository) collection(ctx context.Context) *mongo.Collection {
@@ -563,12 +597,52 @@ func (r *ProductRepository) List(ctx context.Context, filters domain.Filters) ([
 }
 ```
 
+## Transacciones (v2)
+
+Solo con replica set. El callback de `WithTransaction` en v2 recibe un `context.Context` normal (en v1 era un `mongo.SessionContext`), y **ese** contexto es el que hay que pasar a cada operación: si usas el de afuera, la operación corre fuera de la transacción sin avisar.
+
+```go
+func WithTransaction(ctx context.Context, client *mongo.Client, fn func(ctx context.Context) error) error {
+    session, err := client.StartSession()
+    if err != nil {
+        return fmt.Errorf("start session: %w", err)
+    }
+    defer session.EndSession(ctx)
+
+    _, err = session.WithTransaction(ctx, func(ctx context.Context) (any, error) {
+        return nil, fn(ctx)
+    })
+    return err
+}
+
+// Uso: mover stock y registrar el movimiento como una sola unidad.
+func (r *ProductRepository) MoveStock(ctx context.Context, productID string, qty int) error {
+    db := database.DatabaseFromContext(ctx, r.db)
+    return WithTransaction(ctx, r.client, func(ctx context.Context) error {
+        if _, err := db.Collection("products").UpdateOne(ctx,
+            bson.M{"_id": productID},
+            bson.M{"$inc": bson.M{"stock": qty}},
+        ); err != nil {
+            return err
+        }
+        _, err := db.Collection("stock_movements").InsertOne(ctx, bson.M{
+            "productId": productID, "quantity": qty,
+        })
+        return err
+    })
+}
+```
+
+Ojo con multi-tenant: una transacción no puede cruzar clusters. Si el tenant tiene cluster dedicado, la sesión debe abrirse **desde el cliente de ese tenant**, no desde el compartido. Por eso el repositorio guarda también el cliente, no solo la base.
+
 ## Particularidades de Mongo que hay que decidir explícitamente
 
-- **`_id` es el ID de dominio**, un string UUID v7, no un `ObjectID`. Así los IDs son iguales entre el plano de control y los tenants, y una API que los devuelve no cambia de formato según la tabla. UUID v7 además es ordenable por tiempo, lo que mantiene sano el índice.
-- **Transacciones sólo con replica set.** Un Mongo local de un nodo no las soporta. Si la lógica de negocio las necesita (mover stock y registrar el movimiento como una unidad), levanta el entorno de desarrollo como replica set de un nodo (`--replSet rs0` + `rs.initiate()`); el `docker-compose.yml` de `assets/` ya viene así. Si no las necesitas, prefiere operaciones atómicas de un solo documento: `$inc`, `$set` condicionado y `findOneAndUpdate` con filtro son atómicos por documento y resuelven la mayoría de las carreras.
+- **`_id` es el ID de dominio**, un string UUID v7, no un `bson.ObjectID`. Así los IDs son iguales entre el plano de control y los tenants, y una API que los devuelve no cambia de formato según la tabla. UUID v7 además es ordenable por tiempo, lo que mantiene sano el índice.
+- **Transacciones sólo con replica set.** Un Mongo local de un nodo no las soporta. Si la lógica de negocio las necesita, levanta el entorno de desarrollo como replica set de un nodo (`--replSet rs0` + `rs.initiate()`); el `docker-compose.mongo.yml` de `assets/` ya viene así. Si no las necesitas, prefiere operaciones atómicas de un solo documento: `$inc`, `$set` condicionado y `findOneAndUpdate` con filtro son atómicos por documento y resuelven la mayoría de las carreras.
 - **Unicidad = índice único.** No existe la constraint declarativa: si un campo debe ser único, hay un índice único en una migración, y el repositorio traduce el duplicado con `mongo.IsDuplicateKeyError`. Sin ese índice, la validación "ya existe" es un chequeo previo con una carrera en el medio.
 - **Borrado lógico**: `deletedAt: null` en los documentos vivos, e índice único parcial con `partialFilterExpression: {deletedAt: null}` para que el código de un producto borrado se pueda reutilizar.
 - **camelCase en los documentos** (`createdAt`, `isActive`), igual que en el JSON de la API. Ahorra una capa de traducción y hace legible un `find()` en la consola contra la respuesta HTTP.
-- **Escalas de dinero**: Mongo guarda doubles con `float64`, que no sirve para dinero. Usa `Decimal128` (`primitive.NewDecimal128FromString`) o enteros en una escala fija documentada. Elige una y aplícala a todas las colecciones.
+- **Escalas de dinero**: Mongo guarda doubles con `float64`, que no sirve para dinero. Usa `Decimal128` (`bson.ParseDecimal128("1234.56")` — en v1 esto era `primitive.ParseDecimal128`) o enteros en una escala fija documentada. Elige una y aplícala a todas las colecciones.
 - **Validadores de esquema**: opcionales, pero un `$jsonSchema` en la migración que crea la colección atrapa en la base los documentos malformados que la aplicación deja pasar por un bug. Vale la pena en las colecciones críticas.
+- **Timeouts en un solo lugar.** Con `SetTimeout` en el cliente, cada operación hereda el presupuesto; un `context.WithTimeout` por request lo acorta si hace falta, pero nunca lo alarga. No mezcles ambos criterios en cada repositorio.
+- **Slices y maps nil.** Por defecto el driver los codifica como `null`, no como `[]` / `{}`. Si prefieres que un array vacío llegue como `[]` al cliente, decláralo una vez en la conexión con `options.Client().SetBSONOptions(&options.BSONOptions{NilSliceAsEmpty: true, NilMapAsEmpty: true})` en lugar de parchear cada modelo.
