@@ -1,0 +1,49 @@
+services:
+  db:
+    image: mongo:7
+    container_name: app-mongo
+    restart: unless-stopped
+    # Replica set de un solo nodo: Mongo no permite transacciones en modo
+    # standalone. Aunque hoy no las uses, arrancar así evita tener que migrar
+    # el entorno el día que las necesites.
+    command: ["mongod", "--replSet", "rs0", "--bind_ip_all"]
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      # Inicia el replica set en el primer arranque y devuelve OK cuando responde.
+      test: >
+        mongosh --quiet --eval "
+          try { rs.status().ok }
+          catch (e) { rs.initiate({_id:'rs0',members:[{_id:0,host:'localhost:27017'}]}).ok }
+        "
+      interval: 5s
+      timeout: 10s
+      retries: 20
+      start_period: 10s
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: app-api
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      APP_ENV: development
+      APP_PORT: "3000"
+      # directConnection=true porque el replica set se anuncia como
+      # localhost:27017 y desde otro contenedor ese host no resuelve.
+      DATABASE_URL: mongodb://db:27017/app_control?replicaSet=rs0&directConnection=true
+      JWT_SECRET: dev-secret-cambiar-en-produccion
+      JWT_ISSUER: mi-api
+      JWT_EXPIRATION_MINUTES: "60"
+      STARTUP_TIMEOUT_SECONDS: "30"
+    ports:
+      - "3000:3000"
+
+volumes:
+  mongo_data:

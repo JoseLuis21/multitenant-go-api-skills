@@ -1,0 +1,44 @@
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: app-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      # Solo la base de control. Las de los tenants las crea el provisioning
+      # con CREATE DATABASE, por eso el usuario necesita permiso CREATEDB
+      # (el superusuario postgres ya lo tiene).
+      POSTGRES_DB: app_control
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: app-api
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      APP_ENV: development
+      APP_PORT: "3000"
+      DATABASE_URL: postgres://postgres:postgres@db:5432/app_control?sslmode=disable
+      JWT_SECRET: dev-secret-cambiar-en-produccion
+      JWT_ISSUER: mi-api
+      JWT_EXPIRATION_MINUTES: "60"
+      STARTUP_TIMEOUT_SECONDS: "30"
+    ports:
+      - "3000:3000"
+
+volumes:
+  postgres_data:
