@@ -1,11 +1,11 @@
 ---
-name: multitenant-go-api
+name: multitenant-go-api-skills
 description: Levanta desde cero (o completa) una API en Go + Fiber v2 multi-tenant con base de datos por tenant (database-per-tenant), plano de control separado, autenticación JWT y permisos/roles/usuarios centralizados. Pregunta primero si el store es PostgreSQL o MongoDB y genera el scaffold ejecutable para el elegido. Úsala siempre que se hable de arrancar un backend nuevo, multi-tenancy, SaaS multi-empresa, "una API como la de facturación", control plane + tenants, provisioning de bases por cliente, RBAC/ACL, permisos por rol, middleware de tenant, o migrar un proyecto de un solo tenant a multi-tenant — aunque no se nombre "Go" ni "Fiber" explícitamente, y aunque el usuario solo diga "necesito el boilerplate de siempre".
 ---
 
 # API multi-tenant en Go (control plane + base por tenant)
 
-Esta skill reproduce una arquitectura probada en producción: **cada empresa tiene su propia base de datos**, y una **base de control** guarda usuarios, empresas, el registro de bases de tenant y el ACL (roles y permisos). Sirve igual con PostgreSQL o con MongoDB porque todo lo específico del motor vive detrás de dos piezas: el *tenant manager* (resuelve la conexión de la empresa) y los repositorios.
+Esta skill reproduce una arquitectura probada en producción: **cada empresa tiene su propia base de datos**, y una **base de control** guarda usuarios, empresas, el registro de bases de tenant y el ACL (roles y permisos). Sirve igual con PostgreSQL o con MongoDB porque todo lo específico del motor vive detrás de dos piezas: el _tenant manager_ (resuelve la conexión de la empresa) y los repositorios.
 
 El aislamiento es **físico**, no un `WHERE company_id = ?`. Esa es la decisión de fondo: una tabla de tenant nunca lleva columna `company_id`, y una consulta mal escrita no puede filtrar datos de otro cliente porque literalmente no están en esa base.
 
@@ -123,7 +123,7 @@ Vale la pena revisarlos antes de dar el trabajo por cerrado; todos son bugs que 
 
 - **`c.Context()` en vez de `c.UserContext()`** — un módulo entero leyendo la base de control sin error visible.
 - **Ruta literal después de la paramétrica** — en Fiber, `/:id` registrado antes que `/summary` se traga `/summary` y devuelve un 500 de parseo. Las rutas literales van primero, siempre.
-- **Permisos del rol guardados en dos lugares** — si el rol tiene una columna JSON de permisos *y* una tabla `role_permissions`, define cuál manda (la tabla) y haz que la otra sea derivada o no exista. Con dos fuentes, los `INSERT` a la que nadie lee no otorgan nada y el bug tarda meses en aparecer.
+- **Permisos del rol guardados en dos lugares** — si el rol tiene una columna JSON de permisos _y_ una tabla `role_permissions`, define cuál manda (la tabla) y haz que la otra sea derivada o no exista. Con dos fuentes, los `INSERT` a la que nadie lee no otorgan nada y el bug tarda meses en aparecer.
 - **Migración puesta en la carpeta que no se ejecuta** — la tabla nunca se crea y el error aparece recién al primer request.
 - **Escalas distintas entre tablas** — si guardas dinero o cantidades en micro-unidades en un lado y en unidades en otro, los informes cuadran en los tests y mienten en producción. Documenta la escala junto a la columna.
 - **Validar solo contra un tenant vacío** — prueba que el código corre, no que está bien. Siembra datos sintéticos.
@@ -132,12 +132,12 @@ Vale la pena revisarlos antes de dar el trabajo por cerrado; todos son bugs que 
 
 Lee el archivo del store elegido **completo** antes de escribir la capa de datos; los otros, cuando toques esa parte.
 
-| Archivo | Cuándo leerlo |
-|---|---|
-| `references/architecture.md` | Siempre. Plano de control vs tenant, contrato del `TenantManager`, envoltorio de respuestas, cableado del bootstrap. |
-| `references/postgres.md` | Store = PostgreSQL. Pool pgx, provisioning con `CREATE DATABASE`, runner de migraciones `.sql` embebidas, repositorios. |
-| `references/mongodb.md` | Store = MongoDB. Cliente compartido, base por empresa, migraciones como registry de funciones Go, índices, repositorios. |
-| `references/acl.md` | Al construir `auth` y `acl`: esquema de usuarios/roles/permisos, claims del JWT, `RequirePermission`, siembra del rol admin, cómo agregar permisos de un recurso nuevo. |
-| `references/module-template.md` | Cada vez que agregues un módulo de negocio. Checklist completo de las tres capas. |
+| Archivo                         | Cuándo leerlo                                                                                                                                                           |
+| ------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `references/architecture.md`    | Siempre. Plano de control vs tenant, contrato del `TenantManager`, envoltorio de respuestas, cableado del bootstrap.                                                    |
+| `references/postgres.md`        | Store = PostgreSQL. Pool pgx, provisioning con `CREATE DATABASE`, runner de migraciones `.sql` embebidas, repositorios.                                                 |
+| `references/mongodb.md`         | Store = MongoDB. Cliente compartido, base por empresa, migraciones como registry de funciones Go, índices, repositorios.                                                |
+| `references/acl.md`             | Al construir `auth` y `acl`: esquema de usuarios/roles/permisos, claims del JWT, `RequirePermission`, siembra del rol admin, cómo agregar permisos de un recurso nuevo. |
+| `references/module-template.md` | Cada vez que agregues un módulo de negocio. Checklist completo de las tres capas.                                                                                       |
 
 `assets/` trae `Makefile`, `.env.example`, `docker-compose.yml` y `Dockerfile` listos para copiar; solo cambia el nombre del módulo y del proyecto.
